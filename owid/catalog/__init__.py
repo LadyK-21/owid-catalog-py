@@ -1,16 +1,17 @@
 __version__ = "0.1.0"
 
-from .catalogs import LocalCatalog, RemoteCatalog, find, find_one, CHANNEL
-from .datasets import Dataset
 from . import utils
+from .catalogs import CHANNEL, LocalCatalog, RemoteCatalog, find, find_latest, find_one
+from .datasets import Dataset
+from .meta import DatasetMeta, License, Source, TableMeta, VariableMeta
 from .tables import Table
 from .variables import Variable
-from .meta import DatasetMeta, TableMeta, VariableMeta, Source, License
 
 __all__ = [
     "LocalCatalog",
     "RemoteCatalog",
     "find",
+    "find_latest",
     "find_one",
     "Dataset",
     "Table",

@@ -2,23 +2,47 @@
 #  datasets.py
 #
 
-from os.path import join, exists
-from os import mkdir
-from dataclasses import dataclass
+import hashlib
+import json
 import shutil
 import warnings
-from typing import Any, Iterator, List, Literal, Optional, Union
+from dataclasses import dataclass
 from glob import glob
-import hashlib
+from os import mkdir
+from os.path import join
 from pathlib import Path
-import json
+from typing import Any, Iterator, List, Literal, Optional, Union
 
+import numpy as np
 import pandas as pd
+import yaml
 
-from . import tables
+from . import tables, utils
+from .meta import SOURCE_EXISTS_OPTIONS, DatasetMeta, TableMeta
 from .properties import metadata_property
-from .meta import DatasetMeta, TableMeta
-from . import utils
+
+FileFormat = Literal["csv", "feather", "parquet"]
+
+# the formats we can serialise and deserialise; in some cases they
+# will be tried in this order if we don't specify one explicitly
+SUPPORTED_FORMATS: List[FileFormat] = ["feather", "parquet", "csv"]
+
+# the formats we generate by default
+DEFAULT_FORMATS: List[FileFormat] = ["feather", "parquet"]
+
+# the format we use by default if we only need one
+PREFERRED_FORMAT: FileFormat = "feather"
+
+# sanity checks
+assert set(DEFAULT_FORMATS).issubset(SUPPORTED_FORMATS)
+assert PREFERRED_FORMAT in DEFAULT_FORMATS
+assert SUPPORTED_FORMATS[0] == PREFERRED_FORMAT
+
+# available channels in the catalog
+CHANNEL = Literal["garden", "meadow", "grapher", "backport", "open_numbers", "examples", "explorers"]
+
+# all pandas nullable dtypes
+NULLABLE_DTYPES = [f"{sign}{typ}{size}" for typ in ("Int", "Float") for sign in ("", "U") for size in (8, 16, 32, 64)]
 
 
 @dataclass
@@ -40,9 +64,7 @@ class Dataset:
         self.metadata = DatasetMeta.load(self._index_file)
 
     @classmethod
-    def create_empty(
-        cls, path: Union[str, Path], metadata: Optional["DatasetMeta"] = None
-    ) -> "Dataset":
+    def create_empty(cls, path: Union[str, Path], metadata: Optional["DatasetMeta"] = None) -> "Dataset":
         path = Path(path)
 
         if path.is_dir():
@@ -62,71 +84,99 @@ class Dataset:
     def add(
         self,
         table: tables.Table,
-        format: Literal["csv", "feather"] = "feather",
+        formats: List[FileFormat] = DEFAULT_FORMATS,
         repack: bool = True,
     ) -> None:
-        """Add this table to the dataset by saving it in the dataset's folder. Defaults to
-        feather format but you can override this to csv by passing 'csv' for the format.
+        """
+        Add this table to the dataset by saving it in the dataset's folder. By default we
+        save in multiple formats, but if you need a specific one (e.g. CSV for explorers)
+        you can specify it.
 
         :param repack: if True, try to cast column types to the smallest possible type (e.g. float64 -> float32)
-            to reduce feather file size. Consider using False when your dataframe is large and the repack is failing.
+            to reduce binary file size. Consider using False when your dataframe is large and the repack is failing.
         """
 
         utils.validate_underscore(table.metadata.short_name, "Table's short_name")
         for col in list(table.columns) + list(table.index.names):
             utils.validate_underscore(col, "Variable's name")
 
+        # check Float64 and Int64 columns for np.nan
+        for col, dtype in table.dtypes.items():
+            if dtype in NULLABLE_DTYPES:
+                # pandas nullable types like Float64 have their own pd.NA instead of np.nan
+                # make sure we don't use wrong nan, otherwise dropna and other methods won't work
+                assert (
+                    np.isnan(table[col]).sum() == 0
+                ), f"Column `{col}` is using np.nan, but it should be using pd.NA because it has type {table[col].dtype}"
+
         # copy dataset metadata to the table
         table.metadata.dataset = self.metadata
 
-        allowed_formats = ["feather", "csv"]
-        if format not in allowed_formats:
-            raise Exception(f"Format '{format}'' is not supported")
-        table_filename = join(self.path, table.metadata.checked_name + f".{format}")
-        if format == "feather":
-            table.to_feather(table_filename, repack=repack)
-        else:
-            table.to_csv(table_filename)
+        for format in formats:
+            if format not in SUPPORTED_FORMATS:
+                raise Exception(f"Format '{format}'' is not supported")
+
+            table_filename = join(self.path, table.metadata.checked_name + f".{format}")
+            table.to(table_filename, repack=repack)
 
     def __getitem__(self, name: str) -> tables.Table:
-        table_filename = join(self.path, name + ".feather")
-        if exists(table_filename):
-            return tables.Table.read_feather(table_filename)
-        table_filename = join(self.path, name + ".csv")
-        if exists(table_filename):
-            return tables.Table.read_csv(table_filename)
-        raise KeyError(
-            f"Table `{name}` not found, available tables: {', '.join(self.table_names)}"
-        )
+        stem = self.path / Path(name)
+
+        for format in SUPPORTED_FORMATS:
+            path = stem.with_suffix(f".{format}")
+            if path.exists():
+                return tables.Table.read(path)
+
+        raise KeyError(f"Table `{name}` not found, available tables: {', '.join(self.table_names)}")
 
     def __contains__(self, name: str) -> bool:
-        feather_table_filename = join(self.path, name + ".feather")
-        csv_table_filename = join(self.path, name + ".csv")
-        return exists(feather_table_filename) or exists(csv_table_filename)
+        return any((Path(self.path) / name).with_suffix(f".{format}").exists() for format in SUPPORTED_FORMATS)
 
     def save(self) -> None:
+        assert self.metadata.short_name, "Missing dataset short_name"
         utils.validate_underscore(self.metadata.short_name, "Dataset's short_name")
 
         if not self.metadata.namespace:
             warnings.warn(f"Dataset {self.metadata.short_name} is missing namespace")
 
+        # determine channel automatically from path
+        # NOTE: shouldn't we force channel/namespace/version/short_name to be filled from path?
+        # see https://github.com/owid/owid-catalog-py/pull/79#issue-1507959097 for discussion
+        parts = str(self.path).split("/")
+        if len(parts) >= 4:
+            channel, _, _, _ = parts[-4:]
+            if channel in CHANNEL.__args__:  # type: ignore
+                self.metadata.channel = channel
+
         self.metadata.save(self._index_file)
-        self._update_table_metadata()
 
-    def _update_table_metadata(self) -> None:
-        "Update the copy of this dataset's metadata in every table in the set."
-        dataset_meta = self.metadata.to_dict()
+        # Update the copy of this datasets metadata in every table in the set.
+        for table_name in self.table_names:
+            table = self[table_name]
+            table.metadata.dataset = self.metadata
+            table._save_metadata(join(self.path, table.metadata.checked_name + ".meta.json"))
 
-        for metadata_file in glob(join(self.path, "*.meta.json")):
-            with open(metadata_file) as istream:
-                table_meta = json.load(istream)
+    def update_metadata(self, metadata_path: Path, if_source_exists: SOURCE_EXISTS_OPTIONS = "replace") -> None:
+        """
+        Load YAML file with metadata from given path and update metadata of dataset and its tables.
 
-            table_meta["dataset"] = dataset_meta
+        :param metadata_path: Path to *.meta.yml file with metadata. Check out other metadata files
+            for examples, this function doesn't do schema validation
+        :param if_source_exists: What to do if source already exists in metadata. Possible values:
+            - "replace" (default): replace existing source with new one
+            - "append": append new source to existing ones
+            - "fail": raise an exception if source already exists
+        """
+        self.metadata.update_from_yaml(metadata_path, if_source_exists=if_source_exists)
 
-            with open(metadata_file, "w") as ostream:
-                json.dump(table_meta, ostream, indent=2, default=str)
+        with open(metadata_path) as istream:
+            metadata = yaml.safe_load(istream)
+            for table_name in metadata.get("tables", {}).keys():
+                table = self[table_name]
+                table.update_metadata_from_yaml(metadata_path, table_name)
+                table._save_metadata(join(self.path, table.metadata.checked_name + ".meta.json"))
 
-    def index(self, catalog_path: Path) -> pd.DataFrame:
+    def index(self, catalog_path: Path = Path("/")) -> pd.DataFrame:
         """
         Return a DataFrame describing the contents of this dataset, one row per table.
         """
@@ -154,10 +204,7 @@ class Dataset:
             row["path"] = relative_path.as_posix()
             row["channel"] = relative_path.parts[0]
 
-            if table_path.with_suffix(".feather").exists():
-                row["format"] = "feather"
-            elif table_path.with_suffix(".csv").exists():
-                row["format"] = "csv"
+            row["formats"] = [f for f in SUPPORTED_FORMATS if table_path.with_suffix(f".{f}").exists()]  # type: ignore
 
             rows.append(row)
 
@@ -167,30 +214,28 @@ class Dataset:
     def _index_file(self) -> str:
         return join(self.path, "index.json")
 
+    def __bool__(self) -> bool:
+        return True
+
     def __len__(self) -> int:
-        return len(self._data_files)
+        return len(self.table_names)
 
     def __iter__(self) -> Iterator[tables.Table]:
-        for filename in self._data_files:
-            if filename.endswith(".feather"):
-                yield tables.Table.read_feather(filename)
-
-            elif filename.endswith(".csv"):
-                yield tables.Table.read_csv(filename)
-
-            else:
-                raise Exception(f"don't know how to read table: {filename}")
+        for name in self.table_names:
+            yield self[name]
 
     @property
     def _data_files(self) -> List[str]:
-        feather_pattern = join(self.path, "*.feather")
-        csv_pattern = join(self.path, "*.csv")
-        return sorted(glob(feather_pattern) + glob(csv_pattern))
+        files = []
+        for format in SUPPORTED_FORMATS:
+            pattern = join(self.path, f"*.{format}")
+            files.extend(glob(pattern))
+
+        return sorted(files)
 
     @property
     def table_names(self) -> List[str]:
-        """Return table names available in the dataset."""
-        return [Path(f).stem for f in self._data_files]
+        return sorted(set(Path(f).stem for f in self._data_files))
 
     @property
     def _metadata_files(self) -> List[str]:

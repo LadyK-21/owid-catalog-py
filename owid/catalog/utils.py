@@ -1,11 +1,22 @@
 import re
+from typing import List, Literal, Optional, overload
+
 import numpy as np
-from typing import Optional, List, Literal
-from unidecode import unidecode
 import pandas as pd
+from unidecode import unidecode
 
 from .tables import Table
 from .variables import Variable
+
+
+@overload
+def underscore(name: str, validate: bool = True) -> str:
+    ...
+
+
+@overload
+def underscore(name: None, validate: bool = True) -> None:
+    ...
 
 
 def underscore(name: Optional[str], validate: bool = True) -> Optional[str]:
@@ -28,6 +39,7 @@ def underscore(name: Optional[str], validate: bool = True) -> Optional[str]:
         .replace("\t", "_")
         .replace("?", "_")
         .replace('"', "")
+        .replace("‘", "")
         .replace("\xa0", "_")
         .replace("’", "")
         .replace("`", "")
@@ -117,6 +129,7 @@ def _resolve_collisions(
 def underscore_table(
     t: Table,
     collision: Literal["raise", "rename", "ignore"] = "raise",
+    inplace: bool = False,
 ) -> Table:
     """Convert column and index names to underscore. In extremely rare cases
     two columns might have the same underscored version. Use `collision` param
@@ -127,20 +140,28 @@ def underscore_table(
     new_cols = pd.Index([underscore(c) for c in t.columns])
     new_cols = _resolve_collisions(orig_cols, new_cols, collision)
 
-    t = t.rename(columns={c_old: c_new for c_old, c_new in zip(orig_cols, new_cols)})
+    columns_map = {c_old: c_new for c_old, c_new in zip(orig_cols, new_cols)}
+    if inplace:
+        t.rename(columns=columns_map, inplace=True)
+    else:
+        t = t.rename(columns=columns_map)
 
     t.index.names = [underscore(e) for e in t.index.names]
     t.metadata.primary_key = t.primary_key
     t.metadata.short_name = underscore(t.metadata.short_name)
+
+    # put original names as titles into metadata by default
+    for c_old, c_new in columns_map.items():
+        if t[c_new].metadata.title is None:
+            t[c_new].metadata.title = c_old
+
     return t
 
 
-def validate_underscore(name: Optional[str], object_name: str) -> None:
+def validate_underscore(name: Optional[str], object_name: str = "Name") -> None:
     """Raise error if name is not snake_case."""
     if name is not None and not re.match("^[a-z_][a-z0-9_]*$", name):
-        raise NameError(
-            f"{object_name} must be snake_case. Change `{name}` to `{underscore(name, validate=False)}`"
-        )
+        raise NameError(f"{object_name} must be snake_case. Change `{name}` to `{underscore(name, validate=False)}`")
 
 
 def concat_variables(variables: List[Variable]) -> Table:

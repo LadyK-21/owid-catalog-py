@@ -2,10 +2,9 @@
 #  mocking.py
 #
 
-from typing import Any, Union
 import datetime as dt
 import random
-
+from typing import Any, Union
 
 _MOCK_STRINGS = [
     "alpha",
@@ -51,9 +50,7 @@ def mock(_type: type) -> Any:
         return 10 * random.random() / random.random()
 
     elif _type == dt.date:
-        return dt.date.fromordinal(
-            dt.date.today().toordinal() - random.randint(0, 1000)
-        )
+        return dt.date.fromordinal(dt.date.today().toordinal() - random.randint(0, 1000))
 
     elif _type == str:
         # some strings in the frictionless standard must be lowercase with no spaces
@@ -70,12 +67,7 @@ def mock(_type: type) -> Any:
 
     elif hasattr(_type, "__dataclass_fields__"):
         # all dataclasses
-        return _type(
-            **{
-                f.name: mock(f.type)
-                for f in _type.__dataclass_fields__.values()  # type: ignore
-            }
-        )
+        return _type(**{f.name: mock(f.type) for f in _type.__dataclass_fields__.values()})  # type: ignore
 
     elif _type == Any:
         return mock(random.choice([str, int, float]))

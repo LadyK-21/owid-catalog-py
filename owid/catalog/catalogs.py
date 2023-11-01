@@ -3,28 +3,29 @@
 #  owid-catalog-py
 #
 
-from pathlib import Path
-from typing import Dict, Optional, Iterator, Union, Any, cast, Literal, Iterable
+import heapq
 import json
 import os
-import heapq
-
-import pandas as pd
-import numpy as np
-import requests
+import re
 import tempfile
-import structlog
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union, cast
 from urllib.parse import urlparse
-import numpy.typing as npt
 
-from .datasets import Dataset
-from .tables import Table
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
+import requests
+import structlog
+
 from . import s3_utils
+from .datasets import CHANNEL, PREFERRED_FORMAT, SUPPORTED_FORMATS, Dataset, FileFormat
+from .tables import Table
 
 log = structlog.get_logger()
 
 # increment this on breaking changes to require clients to update
-OWID_CATALOG_VERSION = 2
+OWID_CATALOG_VERSION = 3
 
 # location of the default remote catalog
 OWID_CATALOG_URI = "https://catalog.ourworldindata.org/"
@@ -35,10 +36,8 @@ S3_OWID_URI = "s3://owid-catalog"
 # global copy cached after first request
 REMOTE_CATALOG: Optional["RemoteCatalog"] = None
 
-# available channels in the catalog
-CHANNEL = Literal[
-    "garden", "meadow", "backport", "open_numbers", "examples", "explorer"
-]
+# what formats should we for our index of available datasets?
+INDEX_FORMATS: List[FileFormat] = ["feather", "parquet"]
 
 
 class CatalogMixin:
@@ -48,21 +47,26 @@ class CatalogMixin:
 
     channels: Iterable[CHANNEL]
     frame: "CatalogFrame"
+    uri: str
 
     def find(
         self,
         table: Optional[str] = None,
         namespace: Optional[str] = None,
+        version: Optional[str] = None,
         dataset: Optional[str] = None,
         channel: Optional[CHANNEL] = None,
     ) -> "CatalogFrame":
         criteria: npt.ArrayLike = np.ones(len(self.frame), dtype=bool)
 
         if table:
-            criteria &= self.frame.table.apply(lambda t: table in t)
+            criteria &= self.frame.table.str.contains(table)
 
         if namespace:
             criteria &= self.frame.namespace == namespace
+
+        if version:
+            criteria &= self.frame.version == version
 
         if dataset:
             criteria &= self.frame.dataset == dataset
@@ -94,6 +98,16 @@ class CatalogMixin:
         else:
             return cast(Table, frame.sort_values("version").iloc[-1].load())
 
+    def __getitem__(self, path: str) -> Table:
+        uri = "/".join([self.uri.rstrip("/"), path])
+        for _format in SUPPORTED_FORMATS:
+            try:
+                return Table.read(f"{uri}.{_format}")
+            except Exception:
+                continue
+
+        raise KeyError(f"no matching table found at: {uri}")
+
 
 class LocalCatalog(CatalogMixin):
     """
@@ -102,12 +116,10 @@ class LocalCatalog(CatalogMixin):
     which can create such an index.
     """
 
-    path: Path
+    uri: str
 
-    def __init__(
-        self, path: Union[str, Path], channels: Iterable[CHANNEL] = ("garden",)
-    ) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Union[str, Path], channels: Iterable[CHANNEL] = ("garden",)) -> None:
+        self.uri = str(path)
         self.channels = channels
         if self._catalog_exists(channels):
             self.frame = CatalogFrame(self._read_channels(channels))
@@ -118,13 +130,15 @@ class LocalCatalog(CatalogMixin):
 
         # ensure the frame knows where to load data from
 
-    def _catalog_exists(self, channels: Iterable[CHANNEL]) -> bool:
-        return all(
-            [self._catalog_channel_file(channel).exists() for channel in channels]
-        )
+    @property
+    def path(self) -> Path:
+        return Path(self.uri)
 
-    def _catalog_channel_file(self, channel: CHANNEL) -> Path:
-        return self.path / f"catalog-{channel}.feather"
+    def _catalog_exists(self, channels: Iterable[CHANNEL]) -> bool:
+        return all([self._catalog_channel_file(channel).exists() for channel in channels])
+
+    def _catalog_channel_file(self, channel: CHANNEL, format: FileFormat = PREFERRED_FORMAT) -> Path:
+        return self.path / f"catalog-{channel}.{format}"
 
     @property
     def _metadata_file(self) -> Path:
@@ -134,24 +148,20 @@ class LocalCatalog(CatalogMixin):
         """
         Read selected channels from local path.
         """
-        return cast(
-            pd.DataFrame,
-            pd.concat(
-                [
-                    pd.read_feather(self._catalog_channel_file(channel))
-                    for channel in channels
-                ]
-            ),
-        )
+        df = pd.concat([read_frame(self._catalog_channel_file(channel)) for channel in channels])
+        df.dimensions = df.dimensions.map(lambda s: json.loads(s) if isinstance(s, str) else s)
+        return df
 
-    def iter_datasets(self, channel: CHANNEL) -> Iterator[Dataset]:
+    def iter_datasets(self, channel: CHANNEL, include: Optional[str] = None) -> Iterator[Dataset]:
         to_search = [self.path / channel]
         if not to_search[0].exists():
             return
 
+        re_search = re.compile(include or "")
+
         while to_search:
             dir = heapq.heappop(to_search)
-            if (dir / "index.json").exists():
+            if (dir / "index.json").exists() and re_search.search(str(dir)):
                 yield Dataset(dir)
                 continue
 
@@ -159,36 +169,77 @@ class LocalCatalog(CatalogMixin):
                 if child.is_dir():
                     heapq.heappush(to_search, child)
 
-    def reindex(self) -> None:
+    def reindex(self, include: Optional[str] = None) -> None:
+        """
+        Walk the directory tree, generate a channel/namespace/version/dataset/table frame
+        and save it to each of our index formats.
+        """
+        index = self._scan_for_datasets(include)
+
+        if include:
+            # we used regex to find datasets, so merge it with the original frame
+            index = self._merge_index(self.frame, index)
+
+        index._base_uri = self.path.as_posix() + "/"
+
+        # convert int versions to strings
+        index.version = index.version.astype(str)
+
+        # make sure dimensions json is loaded
+        index.dimensions = index.dimensions.map(lambda s: json.loads(s) if isinstance(s, str) else s)
+
+        self._save_index(index)
+        self.frame = index
+
+    @staticmethod
+    def _merge_index(frame: "CatalogFrame", update: "CatalogFrame") -> "CatalogFrame":
+        """Merge two indexes."""
+        return CatalogFrame(
+            pd.concat(
+                [update, frame.loc[~frame.path.isin(update.path)]],
+                ignore_index=True,
+            )
+        )
+
+    def _save_index(self, frame: "CatalogFrame") -> None:
+        """
+        Save all channels to disk in separate catalog files, and in each of our
+        supported formats.
+        """
+        for channel in self.channels:
+            channel_frame = frame.loc[frame.channel == channel].reset_index(drop=True)
+            for format in INDEX_FORMATS:
+                filename = self._catalog_channel_file(channel, format)
+                save_frame(channel_frame, filename)
+
+        # add a catalog version number that we can use to tell old clients to update
         self._save_metadata({"format_version": OWID_CATALOG_VERSION})
 
-        # walk the directory tree, generate a channel/namespace/version/dataset/table frame
-        # save it to feather
+    def _scan_for_datasets(self, include: Optional[str] = None) -> "CatalogFrame":
+        """Scan datasets. You can filter by `include` to get better performance."""
         frames = []
-        log.info("reindex.start", channels=self.channels)
+        log.info("reindex.start", channels=self.channels, include=include)
         for channel in self.channels:
             channel_frames = []
-            for ds in self.iter_datasets(channel):
+            for ds in self.iter_datasets(channel, include=include):
                 channel_frames.append(ds.index(self.path))
             frames += channel_frames
-            log.info("reindex", channel=channel, datasets=len(channel_frames))
+            log.info(
+                "reindex",
+                channel=channel,
+                datasets=len(channel_frames),
+                include=include,
+            )
 
         df = pd.concat(frames, ignore_index=True)
 
         keys = ["table", "dataset", "version", "namespace", "channel", "is_public"]
         columns = keys + [c for c in df.columns if c not in keys]
 
-        df.sort_values(keys, inplace=True)
-        df = df[columns]
+        df.sort_values(keys, inplace=True)  # type: ignore
+        df = df.loc[:, columns]
 
-        # save all channels to disk in separate files
-        for channel in self.channels:
-            df[df.channel == channel].reset_index(drop=True).to_feather(
-                self._catalog_channel_file(channel)
-            )
-
-        self.frame = CatalogFrame(df)
-        self.frame._base_uri = self.path.as_posix() + "/"
+        return CatalogFrame(df)
 
     def _save_metadata(self, contents: Dict[str, Any]) -> None:
         with open(self._metadata_file, "w") as ostream:
@@ -198,9 +249,7 @@ class LocalCatalog(CatalogMixin):
 class RemoteCatalog(CatalogMixin):
     uri: str
 
-    def __init__(
-        self, uri: str = OWID_CATALOG_URI, channels: Iterable[CHANNEL] = ("garden",)
-    ) -> None:
+    def __init__(self, uri: str = OWID_CATALOG_URI, channels: Iterable[CHANNEL] = ("garden",)) -> None:
         self.uri = uri
         self.channels = channels
         self.metadata = self._read_metadata(self.uri + "catalog.meta.json")
@@ -232,15 +281,7 @@ class RemoteCatalog(CatalogMixin):
         """
         Read selected channels from S3.
         """
-        return cast(
-            pd.DataFrame,
-            pd.concat(
-                [
-                    pd.read_feather(uri + f"catalog-{channel}.feather")
-                    for channel in channels
-                ]
-            ),
-        )
+        return pd.concat([read_frame(uri + f"catalog-{channel}.{PREFERRED_FORMAT}") for channel in channels])
 
 
 class CatalogFrame(pd.DataFrame):
@@ -269,8 +310,10 @@ class CatalogFrame(pd.DataFrame):
     def load(self) -> Table:
         if len(self) == 1:
             return self.iloc[0].load()  # type: ignore
-
-        raise ValueError("only one table can be loaded at once")
+        elif len(self) == 0:
+            raise ValueError("no tables found")
+        else:
+            raise ValueError(f"only one table can be loaded at once (tables found: {', '.join(self.table.tolist())})")
 
     @staticmethod
     def create_empty() -> "CatalogFrame":
@@ -287,6 +330,11 @@ class CatalogFrame(pd.DataFrame):
 
 
 class CatalogSeries(pd.Series):
+    """
+    A row from the catalog representing a single dataset. We subclass Series
+    in order to add a `load()` method onto it that will fetch and return a Table.
+    """
+
     _metadata = ["_base_uri"]
 
     @property
@@ -294,47 +342,69 @@ class CatalogSeries(pd.Series):
         return CatalogSeries
 
     def load(self) -> Table:
-        if self.path and self.format and self._base_uri:
+        # determine what format to use for this table; old indexes gave one format,
+        # new ones give multiple to choose from
+        format = None
+        if hasattr(self, "format"):
+            # backwards compatibility with existing indexes
+            format = self.format
+        elif hasattr(self, "formats") and (self.formats is not None) and len(self.formats) > 0:
+            format = PREFERRED_FORMAT if PREFERRED_FORMAT in self.formats else self.formats[0]
+
+        if self.path and format and self._base_uri:
             with tempfile.TemporaryDirectory() as tmpdir:
-                uri = self._base_uri + self.path + "." + self.format
+                uri = self._base_uri + self.path + "." + format
 
                 # download the data locally first if the file is private
                 # keep backward compatibility
                 if not getattr(self, "is_public", True):
                     uri = _download_private_file(uri, tmpdir)
 
-                if self.format == "feather":
-                    return Table.read_feather(uri)
-                elif self.format == "csv":
-                    return Table.read_csv(uri)
-                else:
-                    raise ValueError("unknown format")
+                return Table.read(uri)
 
         raise ValueError("series is not a table spec")
+
+
+def _load_remote_catalog(channels):
+    global REMOTE_CATALOG
+
+    # add channel if missing and reinit remote catalog
+    if REMOTE_CATALOG and not (set(channels) <= set(REMOTE_CATALOG.channels)):
+        REMOTE_CATALOG = RemoteCatalog(channels=list(set(REMOTE_CATALOG.channels) | set(channels)))
+
+    if not REMOTE_CATALOG:
+        REMOTE_CATALOG = RemoteCatalog(channels=channels)
+
+    return REMOTE_CATALOG
 
 
 def find(
     table: Optional[str] = None,
     namespace: Optional[str] = None,
+    version: Optional[str] = None,
     dataset: Optional[str] = None,
     channels: Iterable[CHANNEL] = ("garden",),
 ) -> "CatalogFrame":
-    global REMOTE_CATALOG
+    REMOTE_CATALOG = _load_remote_catalog(channels=channels)
 
-    # add channel if missing and reinit remote catalog
-    if REMOTE_CATALOG and not (set(channels) <= set(REMOTE_CATALOG.channels)):
-        REMOTE_CATALOG = RemoteCatalog(
-            channels=list(set(REMOTE_CATALOG.channels) | set(channels))
-        )
-
-    if not REMOTE_CATALOG:
-        REMOTE_CATALOG = RemoteCatalog(channels=channels)
-
-    return REMOTE_CATALOG.find(table=table, namespace=namespace, dataset=dataset)
+    return REMOTE_CATALOG.find(table=table, namespace=namespace, version=version, dataset=dataset)
 
 
 def find_one(*args: Optional[str], **kwargs: Optional[str]) -> Table:
     return find(*args, **kwargs).load()  # type: ignore
+
+
+def find_latest(
+    table: Optional[str] = None,
+    namespace: Optional[str] = None,
+    dataset: Optional[str] = None,
+    channels: Iterable[CHANNEL] = ("garden",),
+    version: Optional[str] = None,
+) -> Table:
+    REMOTE_CATALOG = _load_remote_catalog(channels=channels)
+
+    # If version is not specified, it will find the latest version given all other specifications.
+    return REMOTE_CATALOG.find_latest(table=table, namespace=namespace, dataset=dataset, version=version)
 
 
 def _download_private_file(uri: str, tmpdir: str) -> str:
@@ -353,3 +423,34 @@ def _download_private_file(uri: str, tmpdir: str) -> str:
 
 class PackageUpdateRequired(Exception):
     pass
+
+
+def read_frame(uri: Union[str, Path]) -> pd.DataFrame:
+    if isinstance(uri, Path):
+        uri = str(uri)
+
+    if uri.endswith(".feather"):
+        return cast(pd.DataFrame, pd.read_feather(uri))
+
+    elif uri.endswith(".parquet"):
+        return cast(pd.DataFrame, pd.read_parquet(uri))
+
+    elif uri.endswith(".csv"):
+        return pd.read_csv(uri)
+
+    raise ValueError(f"could not detect format of uri: {uri}")
+
+
+def save_frame(df: pd.DataFrame, path: Union[str, Path]) -> None:
+    path = str(path)
+    if path.endswith(".feather"):
+        df.to_feather(path)
+
+    elif path.endswith(".parquet"):
+        df.to_parquet(path)
+
+    elif path.endswith(".csv"):
+        df.to_csv(path)
+
+    else:
+        raise ValueError(f"could not detect what format to write to: {path}")

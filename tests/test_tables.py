@@ -2,19 +2,20 @@
 #  test_tables.py
 #
 
-from typing import Literal
-from owid.catalog.variables import Variable
-import tempfile
-from os.path import join, exists, splitext
 import json
+import tempfile
+from os.path import exists, join, splitext
 
 import jsonschema
-import pytest
-import pandas as pd
 import numpy as np
+import pandas as pd
+import pytest
 
-from owid.catalog.tables import Table, SCHEMA
-from owid.catalog.meta import VariableMeta, TableMeta
+from owid.catalog.datasets import FileFormat
+from owid.catalog.meta import TableMeta, VariableMeta
+from owid.catalog.tables import SCHEMA, Table
+from owid.catalog.variables import Variable
+
 from .mocking import mock
 
 
@@ -24,15 +25,19 @@ def test_create():
     assert list(t.country) == ["AU", "SE", "CH"]
 
 
+def test_create_with_underscore():
+    t = Table({"GDP": [100, 102, 104]}, underscore=True, short_name="GDP Table")
+    assert t.columns == ["gdp"]
+    assert t.metadata.short_name == "gdp_table"
+
+
 def test_add_table_metadata():
     t = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]})
 
     # write some metadata
     t.metadata.short_name = "my_table"
     t.metadata.title = "My table indeed"
-    t.metadata.description = (
-        "## Well...\n\nI discovered this table in the Summer of '63..."
-    )
+    t.metadata.description = "## Well...\n\nI discovered this table in the Summer of '63..."
 
     # metadata persists with slicing
     t2 = t.iloc[:2]
@@ -86,49 +91,39 @@ def test_saving_empty_table_fails():
 
 
 # The parametrize decorator runs this test multiple times with different formats
-@pytest.mark.parametrize("format", ["csv", "feather"])
-def test_round_trip_no_metadata(format: Literal["csv", "feather"]) -> None:
+@pytest.mark.parametrize("format", ["csv", "feather", "parquet"])
+def test_round_trip_no_metadata(format: FileFormat) -> None:
     t1 = Table({"gdp": [100, 102, 104, 100], "countries": ["AU", "SE", "NA", "💡"]})
     with tempfile.TemporaryDirectory() as path:
         filename = join(path, f"table.{format}")
-        if format == "feather":
-            t1.to_feather(filename)
-        else:
-            t1.to_csv(filename)
+        t1.to(filename)
 
         assert exists(filename)
-        assert exists(splitext(filename)[0] + ".meta.json")
+        if format in ["csv", "feather"]:
+            assert exists(splitext(filename)[0] + ".meta.json")
 
-        if format == "feather":
-            t2 = Table.read_feather(filename)
-        else:
-            t2 = Table.read_csv(filename)
+        t2 = Table.read(filename)
         assert_tables_eq(t1, t2)
 
 
-@pytest.mark.parametrize("format", ["csv", "feather"])
-def test_round_trip_with_index(format: Literal["csv", "feather"]) -> None:
+@pytest.mark.parametrize("format", ["csv", "feather", "parquet"])
+def test_round_trip_with_index(format: FileFormat) -> None:
     t1 = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "NA"]})
     t1.set_index("country", inplace=True)
     with tempfile.TemporaryDirectory() as path:
         filename = join(path, f"table.{format}")
-        if format == "feather":
-            t1.to_feather(filename)
-        else:
-            t1.to_csv(filename)
+        t1.to(filename)
 
         assert exists(filename)
-        assert exists(splitext(filename)[0] + ".meta.json")
+        if format in ["csv", "feather"]:
+            assert exists(splitext(filename)[0] + ".meta.json")
 
-        if format == "feather":
-            t2 = Table.read_feather(filename)
-        else:
-            t2 = Table.read_csv(filename)
+        t2 = Table.read(filename)
         assert_tables_eq(t1, t2)
 
 
-@pytest.mark.parametrize("format", ["csv", "feather"])
-def test_round_trip_with_metadata(format: Literal["csv", "feather"]) -> None:
+@pytest.mark.parametrize("format", ["csv", "feather", "parquet"])
+def test_round_trip_with_metadata(format: FileFormat) -> None:
     t1 = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "NA"]})
     t1.set_index("country", inplace=True)
     t1.title = "A very special table"
@@ -136,18 +131,13 @@ def test_round_trip_with_metadata(format: Literal["csv", "feather"]) -> None:
 
     with tempfile.TemporaryDirectory() as path:
         filename = join(path, f"table.{format}")
-        if format == "feather":
-            t1.to_feather(filename)
-        else:
-            t1.to_csv(filename)
+        t1.to(filename)
 
         assert exists(filename)
-        assert exists(splitext(filename)[0] + ".meta.json")
+        if format in ["csv", "feather"]:
+            assert exists(splitext(filename)[0] + ".meta.json")
 
-        if format == "feather":
-            t2 = Table.read_feather(filename)
-        else:
-            t2 = Table.read_csv(filename)
+        t2 = Table.read(filename)
         assert_tables_eq(t1, t2)
 
 
@@ -209,9 +199,7 @@ def test_field_access_can_be_typecast():
 
 def test_tables_can_drop_duplicates():
     # https://github.com/owid/owid-catalog-py/issues/11
-    t: Table = Table(
-        {"gdp": [100, 100, 102, 104], "country": ["AU", "AU", "SE", "CH"]}
-    ).set_index(
+    t: Table = Table({"gdp": [100, 100, 102, 104], "country": ["AU", "AU", "SE", "CH"]}).set_index(
         "country"
     )  # type: ignore
     t.metadata = mock(TableMeta)
@@ -239,9 +227,7 @@ def assert_tables_eq(lhs: Table, rhs: Table) -> None:
 
 
 def mock_table() -> Table:
-    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index(
-        "country"
-    )  # type: ignore
+    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index("country")  # type: ignore
     t.metadata = mock(TableMeta)
     t.metadata.primary_key = ["country"]
     for col in t.all_columns:
@@ -251,15 +237,11 @@ def mock_table() -> Table:
 
 
 def test_load_csv_table_over_http() -> None:
-    Table.read_csv(
-        "http://owid-catalog.nyc3.digitaloceanspaces.com/reference/countries_regions.csv"
-    )
+    Table.read_csv("http://owid-catalog.nyc3.digitaloceanspaces.com/reference/countries_regions.csv")
 
 
 def test_rename_columns() -> None:
-    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index(
-        "country"
-    )  # type: ignore
+    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index("country")  # type: ignore
     t.gdp.metadata.title = "GDP"
     new_t = t.rename(columns={"gdp": "new_gdp"})
     assert new_t.new_gdp.metadata.title == "GDP"
@@ -270,10 +252,104 @@ def test_rename_columns() -> None:
 
 
 def test_rename_columns_inplace() -> None:
-    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index(
-        "country"
-    )  # type: ignore
+    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index("country")  # type: ignore
     t.gdp.metadata.title = "GDP"
     t.rename(columns={"gdp": "new_gdp"}, inplace=True)
     assert t.new_gdp.metadata.title == "GDP"
     assert t.columns == ["new_gdp"]
+
+
+def test_copy() -> None:
+    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]}).set_index("country")  # type: ignore
+    t.metadata.title = "GDP table"
+    t.gdp.metadata.title = "GDP"
+    t2 = t.copy()
+
+    t2.metadata.title = "GDP table copy"
+    t2.gdp.metadata.title = "GDP copy"
+    t2.reset_index(inplace=True)
+
+    assert t.gdp.metadata.title == "GDP"
+    assert t.metadata.title == "GDP table"
+    assert t.primary_key == ["country"]
+
+    assert t2.gdp.metadata.title == "GDP copy"
+    assert t2.metadata.title == "GDP table copy"
+    assert t2.primary_key == []
+
+
+def test_copy_metadata_from() -> None:
+    t: Table = Table({"gdp": [100, 102, 104], "country": ["AU", "SE", "CH"]})
+    t.metadata.title = "GDP table"
+    t.gdp.metadata.title = "GDP"
+
+    t2: Table = Table(pd.DataFrame(t))
+    t2.country.metadata.title = "Country"
+
+    t2.copy_metadata_from(t)
+
+    assert t2.gdp.metadata.title == "GDP"
+    assert t2.country.metadata.title == "Country"
+    assert t2.metadata.title == "GDP table"
+
+
+def test_addition_without_metadata() -> None:
+    t: Table = Table({"a": [1, 2], "b": [3, 4]})
+    t["c"] = t["a"] + t["b"]
+    assert t.c.metadata == VariableMeta()
+
+
+def test_addition_with_metadata() -> None:
+    t: Table = Table({"a": [1, 2], "b": [3, 4]})
+    t.a.metadata.title = "A"
+    t.b.metadata.title = "B"
+
+    t["c"] = t["a"] + t["b"]
+
+    # addition should not inherit metadata
+    assert t.c.metadata == VariableMeta()
+
+    t.c.metadata.title = "C"
+
+    # addition shouldn't change the metadata of the original columns
+    assert t.a.metadata.title == "A"
+    assert t.b.metadata.title == "B"
+    assert t.c.metadata.title == "C"
+
+
+def test_addition_same_variable() -> None:
+    t: Table = Table({"a": [1, 2], "b": [3, 4]})
+    t.a.metadata.title = "A"
+    t.b.metadata.title = "B"
+
+    t["a"] = t["a"] + t["b"]
+
+    # addition shouldn't change the metadata of the original columns
+    assert t.a.metadata.title == "A"
+    assert t.b.metadata.title == "B"
+
+
+def test_set_index_keeps_metadata() -> None:
+    tb = Table(pd.DataFrame({"a": [1, 2], "b": [3, 4]}))
+    tb["a"].metadata.title = "A"
+    tb["b"].metadata.title = "B"
+
+    tb_new = tb.set_index(["a"])
+    tb_new = tb_new.reset_index()
+
+    # metadata should be preserved
+    assert tb_new["a"].metadata.title == "A"
+    assert tb_new["b"].metadata.title == "B"
+
+
+def test_set_index_keeps_metadata_inplace() -> None:
+    tb = Table(pd.DataFrame({"a": [1, 2], "b": [3, 4]}))
+    tb["a"].metadata.title = "A"
+    tb["b"].metadata.title = "B"
+
+    tb_new = tb.set_index(["a"])
+    tb_new.reset_index(inplace=True)
+
+    # metadata should be preserved
+    assert tb_new["a"].metadata.title == "A"
+    assert tb_new["b"].metadata.title == "B"

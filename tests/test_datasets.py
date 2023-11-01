@@ -2,22 +2,24 @@
 #  test_datasets.py
 #
 
-import tempfile
-from os.path import join, exists
-from os import rmdir
 import json
-import shutil
-from contextlib import contextmanager
-from typing import Iterator, Union
 import random
+import shutil
+import tempfile
+from contextlib import contextmanager
 from glob import glob
+from os import rmdir
+from os.path import exists, join
 from pathlib import Path
+from typing import Any, Iterator, Optional, Union
 
 import pytest
+import yaml
 
 from owid.catalog import Dataset, DatasetMeta
-from .test_tables import mock_table
+
 from .mocking import mock
+from .test_tables import mock_table
 
 
 def test_dataset_fails_to_load_empty_folder():
@@ -30,12 +32,14 @@ def test_create_empty():
     with temp_dataset_dir(create=True) as dirname:
         shutil.rmtree(dirname)
 
-        Dataset.create_empty(dirname)
+        ds = Dataset.create_empty(dirname)
 
         assert exists(join(dirname, "index.json"))
         with open(join(dirname, "index.json")) as istream:
             doc = json.load(istream)
         assert doc == {"is_public": True}
+
+        assert len(ds.index()) == 0
 
 
 def test_create_empty_with_metadata(tmpdir):
@@ -80,10 +84,16 @@ def test_add_table():
         # check that it's really on disk
         table_files = [
             join(dirname, t.metadata.checked_name + ".feather"),
+            join(dirname, t.metadata.checked_name + ".parquet"),
             join(dirname, t.metadata.checked_name + ".meta.json"),
         ]
         for filename in table_files:
             assert exists(filename)
+
+        # check other methods on Dataset
+        assert len(ds) == 1
+        assert len(ds.index()) == 1
+        assert t.metadata.checked_name in ds
 
         # load a fresh copy from disk
         t2 = ds[t.metadata.checked_name]
@@ -103,7 +113,7 @@ def test_add_table_csv():
         ds = Dataset.create_empty(dirname)
 
         # add the table, it should be on disk now
-        ds.add(t, format="csv")
+        ds.add(t, formats=["csv"])
 
         # check that it's really on disk
         table_files = [
@@ -112,6 +122,30 @@ def test_add_table_csv():
         ]
         for filename in table_files:
             assert exists(filename)
+
+        # load a fresh copy from disk
+        t2 = ds[t.metadata.checked_name]
+        assert id(t2) != id(t)
+
+        # the fresh copy from disk should be identical to the copy we added
+        assert t2.equals_table(t)
+
+
+def test_add_table_parquet():
+    t = mock_table()
+
+    with temp_dataset_dir() as dirname:
+        # make a dataset
+        ds = Dataset.create_empty(dirname)
+
+        # add the table, it should be on disk now
+        ds.add(t, formats=["parquet"])
+
+        # check that it's really on disk
+        assert exists(join(dirname, t.metadata.checked_name + ".parquet"))
+
+        # metadata exists as a sidecar JSON
+        assert exists(join(dirname, t.metadata.checked_name + ".meta.json"))
 
         # load a fresh copy from disk
         t2 = ds[t.metadata.checked_name]
@@ -202,6 +236,54 @@ def test_snake_case_table():
             d.add(t)
 
 
+def test_update_metadata(tmp_path):
+    with mock_dataset() as d:
+        table_name = d.table_names[0]
+
+        # create test yml file
+        temp_file = tmp_path / "my.meta.yml"
+        meta = {
+            "dataset": {"title": "Dataset title from YAML"},
+            "tables": {table_name: {"variables": {"gdp": {"title": "Variable title from YAML"}}}},
+        }
+        temp_file.write_text(yaml.dump(meta))
+
+        d.update_metadata(temp_file)
+
+        assert d.metadata.title == "Dataset title from YAML"
+        assert d[table_name]["gdp"].metadata.title == "Variable title from YAML"
+
+
+def test_bool():
+    with mock_dataset(n_tables=0) as d:
+        assert bool(d)
+
+
+def test_save_fills_channel(tmp_path: Path):
+    path = tmp_path / "garden/owid/latest/shortname"
+    path.parent.mkdir(exist_ok=True, parents=True)
+
+    d = Dataset.create_empty(path)
+    d.metadata = mock(DatasetMeta)
+    d.save()
+
+    d2 = Dataset(path)
+    assert d2.metadata.channel == "garden"
+
+
+def test_save_without_valid_channel(tmp_path: Path):
+    path = tmp_path / "invalid/owid/latest/shortname"
+    path.parent.mkdir(exist_ok=True, parents=True)
+
+    d = Dataset.create_empty(path)
+    d.metadata = mock(DatasetMeta)
+    d.metadata.channel = None
+    d.save()
+
+    d2 = Dataset(path)
+    assert d2.metadata.channel is None
+
+
 @contextmanager
 def temp_dataset_dir(create: bool = False) -> Iterator[str]:
     with tempfile.TemporaryDirectory() as dirname:
@@ -210,20 +292,24 @@ def temp_dataset_dir(create: bool = False) -> Iterator[str]:
         yield dirname
 
 
-def create_temp_dataset(dirname: Union[Path, str]) -> Dataset:
+def create_temp_dataset(dirname: Union[Path, str], n_tables: Optional[int] = None) -> Dataset:
     d = Dataset.create_empty(dirname)
     d.metadata = mock(DatasetMeta)
     d.metadata.short_name = Path(dirname).name
     d.metadata.is_public = True
     d.save()
-    for _ in range(random.randint(2, 5)):
+
+    if n_tables is None:
+        n_tables = random.randint(2, 5)
+
+    for _ in range(n_tables):
         t = mock_table()
         d.add(t)
     return d
 
 
 @contextmanager
-def mock_dataset() -> Iterator[Dataset]:
+def mock_dataset(**kwargs: Any) -> Iterator[Dataset]:
     with temp_dataset_dir() as dirname:
-        d = create_temp_dataset(dirname)
+        d = create_temp_dataset(dirname, **kwargs)
         yield d

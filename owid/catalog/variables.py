@@ -2,14 +2,14 @@
 #  variables.py
 #
 
-from os import path
 import json
+from os import path
 from typing import Any, Dict, Optional, cast
 
 import pandas as pd
 
-from .properties import metadata_property
 from .meta import VariableMeta
+from .properties import metadata_property
 
 SCHEMA = json.load(open(path.join(path.dirname(__file__), "schemas", "table.json")))
 METADATA_FIELDS = list(SCHEMA["properties"])
@@ -40,13 +40,15 @@ class Variable(pd.Series):
 
     @name.setter
     def name(self, name: str) -> None:
-        # move metadata when you rename a field
-        if self._name and self._name in self._fields:
-            self._fields[name] = self._fields.pop(self._name)
+        # None name does not modify _fields, it is usually triggered on pandas operations
+        if name is not None:
+            # move metadata when you rename a field
+            if self._name and self._name in self._fields:
+                self._fields[name] = self._fields.pop(self._name)
 
-        # make sure there is always a placeholder metadata object
-        if name not in self._fields:
-            self._fields[name] = VariableMeta()
+            # make sure there is always a placeholder metadata object
+            if name not in self._fields:
+                self._fields[name] = VariableMeta()
 
         self._name = name
 

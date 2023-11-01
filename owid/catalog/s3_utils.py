@@ -2,15 +2,14 @@
 It would make sense to move both into a shared module in the future or use some proper public library
 for working with S3 that is compatible with DigitalOcean's Spaces.
 """
+import logging
 import os
 from os import path
-import logging
-from typing import Tuple, Any
+from typing import Any, Tuple
 from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
-
 
 SPACES_ENDPOINT = "https://nyc3.digitaloceanspaces.com"
 S3_BASE = "s3://walden.nyc3.digitaloceanspaces.com"
@@ -86,7 +85,7 @@ def connect() -> Any:
 def check_for_default_profile() -> None:
     filename = path.expanduser("~/.aws/config")
     if not path.exists(filename) or f"[{AWS_PROFILE}]" not in open(filename).read():
-        raise Exception(
+        raise MissingCredentialsError(
             f"""you must set up a config file at ~/.aws/config
 
 it should look like:
@@ -94,8 +93,13 @@ it should look like:
 [{AWS_PROFILE}]
 aws_access_key_id = ...
 aws_secret_access_key = ...
+region = ...
 """
         )
+
+
+class MissingCredentialsError(Exception):
+    pass
 
 
 class UploadError(Exception):

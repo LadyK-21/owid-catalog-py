@@ -4,12 +4,12 @@
 #  Metadata helpers.
 #
 
-from pathlib import Path
-from typing import Optional, TypeVar, Dict, Any, List, Union
-from dataclasses import dataclass, field
 import json
-import yaml
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, TypeVar, Union
 
+import yaml
 from dataclasses_json import dataclass_json
 
 T = TypeVar("T")
@@ -19,13 +19,14 @@ def pruned_json(cls: T) -> T:
     orig = cls.to_dict  # type: ignore
 
     # only keep non-null public variables
-    cls.to_dict = lambda self: {  # type: ignore
-        k: v
-        for k, v in orig(self).items()
-        if not k.startswith("_") and v not in [None, [], {}]
+    cls.to_dict = lambda self, **kwargs: {  # type: ignore
+        k: v for k, v in orig(self, **kwargs).items() if not k.startswith("_") and v not in [None, [], {}]
     }
 
     return cls
+
+
+SOURCE_EXISTS_OPTIONS = Literal["fail", "append", "replace"]
 
 
 @pruned_json
@@ -56,15 +57,24 @@ class Source:
     def to_dict(self) -> Dict[str, Any]:
         ...
 
+    def update(self, **kwargs: Dict[str, Any]) -> None:
+        for key, value in kwargs.items():
+            if value is not None:
+                setattr(self, key, value)
+
 
 @pruned_json
 @dataclass_json
 @dataclass
 class License:
-    name: Optional[str]
-    url: Optional[str]
+    name: Optional[str] = None
+    url: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        ...
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "License":
         ...
 
 
@@ -90,7 +100,7 @@ class VariableMeta:
     title: Optional[str] = None
     description: Optional[str] = None
     sources: List[Source] = field(default_factory=list)
-    licenses: List[Source] = field(default_factory=list)
+    licenses: List[License] = field(default_factory=list)
     unit: Optional[str] = None
     short_unit: Optional[str] = None
     display: Optional[Dict[str, Any]] = None
@@ -116,6 +126,7 @@ class DatasetMeta:
     the variable level.
     """
 
+    channel: Optional[str] = None
     namespace: Optional[str] = None
     # NOTE: short_name should be underscore and validate in setter, however this
     # is nontrivial to do with `dataclass_json` (see https://github.com/lidatong/dataclasses-json/issues/176)
@@ -159,27 +170,45 @@ class DatasetMeta:
     def from_dict(d: Dict[str, Any]) -> "DatasetMeta":
         ...
 
-    def update_from_yaml(self, path: Union[Path, str]) -> None:
+    def update_from_yaml(self, path: Union[Path, str], if_source_exists: SOURCE_EXISTS_OPTIONS = "fail") -> None:
         """The main reason for wanting to do this is to manually override what goes into Grapher before an export."""
         with open(path) as istream:
             annot = yaml.safe_load(istream)
 
-        # update sources of dataset
-        for source_annot in annot["dataset"].get("sources", []):
+        dataset_sources = annot.get("dataset", {}).get("sources", []) or []
+
+        # update sources of dataset, if there are no sources in the new dataset, don't update existing ones
+        if if_source_exists == "replace" and dataset_sources:
+            self.sources = []
+
+        new_sources = []
+        for source_annot in dataset_sources:
             # if there's an existing source, update it
             ds_sources = [s for s in self.sources if s.name == source_annot["name"]]
             if ds_sources:
-                # TODO: add `update` method to Source object instead of `setattr``
-                for k, v in source_annot.items():
-                    setattr(ds_sources[0], k, v)
-            # otherwise create new source
+                ds_sources[0].update(**source_annot)
+            # there is already a source in a dataset, raise an error
+            elif self.sources and if_source_exists == "fail":
+                raise ValueError(f"Source {self.sources[0].name} would be overwritten by source {source_annot['name']}")
+            # otherwise append it
             else:
-                self.sources.append(Source(**source_annot))
+                new_sources.append(Source(**source_annot))
+
+        self.sources.extend(new_sources)
 
         # update dataset
-        for k, v in annot["dataset"].items():
+        for k, v in annot.get("dataset", {}).items():
             if k != "sources":
                 setattr(self, k, v)
+
+    @property
+    def uri(self) -> str:
+        """Return unique URI for this dataset if"""
+        assert self.channel, "DatasetMeta.channel is not set"
+        assert self.namespace, "DatasetMeta.namespace is not set"
+        assert self.version, "DatasetMeta.version is not set"
+        assert self.short_name, "DatasetMeta.short_name is not set"
+        return f"{self.channel}/{self.namespace}/{self.version}/{self.short_name}"
 
 
 @pruned_json
@@ -201,6 +230,9 @@ class TableMeta:
             raise Exception("table has no short_name")
 
         return self.short_name
+
+    def to_dict(self) -> Dict[str, Any]:
+        ...
 
     @staticmethod
     def from_dict(dict: Dict[str, Any]) -> "TableMeta":
